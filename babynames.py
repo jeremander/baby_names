@@ -20,6 +20,10 @@ def get_soup(url: str) -> BeautifulSoup:
     response = requests.get(url)
     return BeautifulSoup(response.text, 'html.parser')
 
+def normalize_name(name: str) -> str:
+    return re.sub(r'\(?\d+\)?$', '', name).strip()
+
+
 class BehindTheName:
     """Class for scraping name info from behindthename.com."""
     def __init__(self, get_ratings: bool = False) -> None:
@@ -39,7 +43,7 @@ class BehindTheName:
     @staticmethod
     def process_name_entry(entry: Tag) -> Tuple[str, JSONDict]:
         name = entry.find('span', attrs = {'class' : 'listname'}).text
-        name = re.sub(r'\(?\d+\)?$', '', name).strip()  # some entries have multiple versions
+        name = normalize_name(name)  # some entries have multiple versions
         gender = ''
         if entry.find('span', attrs = {'class' : 'masc'}):
             gender += 'M'
@@ -50,7 +54,7 @@ class BehindTheName:
             # TODO: description is too long, need to navigate to its page
             # TODO: also get variants, diminutives, etc.
         description = ''.join(piece.text if hasattr(piece, 'text') else piece for piece in entry.find('br').next_siblings)
-        related = [link.text for link in entry.find_all(class_ = 'nl')]
+        related = [normalize_name(link.text) for link in entry.find_all(class_ = 'nl')]
         entry_data: JSONDict = {}
         if gender:
             entry_data['gender'] = gender
