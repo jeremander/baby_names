@@ -1,6 +1,6 @@
 """Script for scraping baby name info from behindthename.com, and baby name frequencies in the USA from the Social Security Administration website."""
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,8 +8,9 @@ import json
 import os
 import re
 import requests
+import string
 from tqdm import tqdm
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, Tuple
 
 AnyDict = Dict[Any, Any]
 JSONDict = Dict[str, Any]
@@ -23,8 +24,7 @@ class BehindTheName:
     """Class for scraping name info from behindthename.com."""
     def __init__(self, get_ratings: bool = False) -> None:
         self.get_ratings = get_ratings
-        self.name_info: Dict[str, List[JSONDict]] = defaultdict(list)
-        self._done: Set[Tuple[str, int]] = set()
+        self.name_info: JSONDict = {'first' : defaultdict(list), 'last' : defaultdict(list)}
     def save(self, path: str) -> None:
         d = {'has_ratings' : self.get_ratings, 'names' : self.name_info}
         with open(path, 'w') as f:
@@ -36,34 +36,37 @@ class BehindTheName:
         btn = cls(d['has_ratings'])
         btn.name_info = d['names']
         return btn
+    @staticmethod
+    def process_name_entry(entry: Tag) -> Tuple[str, JSONDict]:
+        name = entry.find('span', attrs = {'class' : 'listname'}).text
+        name = re.sub(r'\(?\d+\)?$', '', name).strip()  # some entries have multiple versions
+        gender = ''
+        if entry.find('span', attrs = {'class' : 'masc'}):
+            gender += 'M'
+        if entry.find('span', attrs = {'class' : 'fem'}):
+            gender += 'F'
+        languages = [lang.text for lang in entry.find_all('a', attrs = {'class' : 'usg'})]
+        # if entry.find(class_ = 'text-function'):
+            # TODO: description is too long, need to navigate to its page
+            # TODO: also get variants, diminutives, etc.
+        description = ''.join(piece.text if hasattr(piece, 'text') else piece for piece in entry.find('br').next_siblings)
+        related = [link.text for link in entry.find_all(class_ = 'nl')]
+        entry_data: JSONDict = {}
+        if gender:
+            entry_data['gender'] = gender
+        entry_data.update({'languages' : languages, 'descr' : description})
+        # print(f'{name}\nGender: {gender}\nLanguages: {str(languages)[1:-1]}\nDescription: {description}\n')
+        if related:
+            entry_data['related'] = related
+        return (name, entry_data)
     def scrape_first_name_page(self, gender: str, pagenum: int) -> None:
         """Scrapes data from a single page."""
-        if (gender, pagenum) in self._done:
-            print(f'skipping ({gender}, {pagenum})')
-            return
         names_url = os.path.join('https://www.behindthename.com/names/gender', gender)
         page_url = os.path.join(names_url, str(pagenum))
         soup = get_soup(page_url)
         entries = soup.find_all('div', attrs = {'class' : 'browsename'})
         for entry in entries:
-            name = entry.find('span', attrs = {'class' : 'listname'}).text
-            gender = ''
-            if entry.find('span', attrs = {'class' : 'masc'}):
-                gender += 'M'
-            if entry.find('span', attrs = {'class' : 'fem'}):
-                gender += 'F'
-            languages = []
-            for lang in entry.find_all('a', attrs = {'class' : 'usg'}):
-                languages.append(lang.text)
-            # if entry.find(class_ = 'text-function'):
-                # TODO: description is too long, need to navigate to its page
-                # TODO: also get variants, diminutives, etc.
-            description = ''.join(piece.text if hasattr(piece, 'text') else piece for piece in entry.find('br').next_siblings)
-            related = [link.text for link in entry.find_all(class_='nl')]
-            # print(f'{name}\nGender: {gender}\nLanguages: {str(languages)[1:-1]}\nDescription: {description}\n')
-            entry_data: JSONDict = {'gender' : gender, 'languages' : languages, 'descr' : description}
-            if related:
-                entry_data['related'] = related
+            (name, entry_data) = self.process_name_entry(entry)
             if self.get_ratings:  # get the ratings
                 rating_url = os.path.join('https://www.behindthename.com', entry.find('a').attrs['href'][1:], 'rating')
                 try:
@@ -80,10 +83,8 @@ class BehindTheName:
                         entry_data['num_raters'] = int(table.find_next_sibling().text.split()[-2])
                 except (ConnectionError, TimeoutError):
                     continue
-            name = re.sub(r'\d+$', '', name).strip()  # some entries have multiple versions
-            if (entry_data not in self.name_info[name]):
-                self.name_info[name].append(entry_data)
-        self._done.add((gender, pagenum))
+            if (entry_data not in self.name_info['first'][name]):
+                self.name_info['first'][name].append(entry_data)
     def scrape_first_names(self) -> None:
         for gender in ['masculine', 'feminine', 'unisex']:
             print(f'Scraping {gender} names...')
@@ -94,6 +95,37 @@ class BehindTheName:
             maxpage = max(pagenums)
             for pagenum in tqdm(range(1, maxpage + 1)):
                 self.scrape_first_name_page(gender, pagenum)
+    @staticmethod
+    def base_surname_url(submit: bool) -> str:
+        return 'https://surnames.behindthename.com/submit/names/letter' if submit else 'https://surnames.behindthename.com/names/letter'
+    def scrape_last_name_page(self, letter: str, pagenum: int, submit: bool) -> None:
+        surnames_url = os.path.join(self.base_surname_url(submit), letter)
+        page_url = os.path.join(surnames_url, str(pagenum))
+        soup = get_soup(page_url)
+        entries = soup.find_all('div', attrs = {'class' : 'browsename'})
+        for entry in entries:
+            (name, entry_data) = self.process_name_entry(entry)
+            entry_data['submitted'] = submit
+            descr = entry_data.get('descr')
+            eds = self.name_info['last'][name]
+            if (not any(descr == ed.get('descr') for ed in eds)):
+                eds.append(entry_data)
+
+    def scrape_last_names(self) -> None:
+        for submit in [False, True]:
+            if submit:
+                print('Scraping user-submitted surnames...')
+            else:
+                print('Scraping surnames...')
+            for letter in string.ascii_lowercase:
+                print(letter)
+                surnames_url = os.path.join(self.base_surname_url(submit), letter)
+                soup = get_soup(surnames_url)
+                page_href = os.path.join('^/submit/names/letter' if submit else '^/names/letter', letter, '*')
+                pagenums = [int(a.attrs.get('href').split('/')[-1]) for a in soup.find_all('a', href = re.compile(page_href))]
+                maxpage = max(pagenums) if pagenums else 1
+                for pagenum in tqdm(range(1, maxpage + 1)):
+                    self.scrape_last_name_page(letter, pagenum, submit)
 
 class SSA:
     """Class for scraping name stats from the SSA website."""
@@ -143,7 +175,7 @@ class NameDB:
         """Merges in stats from SSA."""
         for (name, d) in ssa.name_stats.items():
             for (gender, stats) in d.items():
-                entries = self.btn.name_info.setdefault(name, [])
+                entries = self.btn.name_info['first'].setdefault(name, [])
                 for entry in entries:
                     if (gender in entry['gender']):  # matched the entry
                         break
